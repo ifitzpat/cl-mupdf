@@ -25,6 +25,7 @@
   :source-control (:git "https://github.com/ifitzpat/cl-mupdf.git")
 
   :depends-on (#:cffi
+               #:cffi-libffi ; Required for struct-by-value (fz_rect, fz_matrix)
                #:alexandria
                #:trivial-garbage)
 
