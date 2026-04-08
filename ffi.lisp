@@ -114,20 +114,82 @@ MAKE-CONTEXT if you have a different MuPDF version installed.")
 ;;; ----------------------------------------------------------------------------
 ;;; Foreign struct definitions
 ;;; ----------------------------------------------------------------------------
+;;;
+;;; CFFI does not ship with a built-in size_t type.  On 64-bit POSIX
+;;; platforms (the ones Guix actually builds this package on) size_t is
+;;; unsigned long; that's the definition we use here.  If you port this
+;;; to 64-bit Windows (LLP64 where long is 32 bits) you will need to
+;;; redefine SIZE-T as :UINT64.
+(cffi:defctype size-t :unsigned-long)
 
-(cffi:defcstruct fz-rect-c
+;;; A note on struct-by-value:
+;;;
+;;; Several MuPDF functions take fz_rect or fz_matrix structs *by value*
+;;; (e.g. fz_bound_page returns fz_rect, pdf_set_annot_rect takes fz_rect,
+;;; fz_new_pixmap_from_page takes fz_matrix).  CFFI only supports passing
+;;; unboxed structs through defcfun when the struct is defined with a
+;;; :class option and translate-* methods are provided.
+;;;
+;;; Our translators use Lisp plists whose keys are the struct slot symbols
+;;; (e.g. '(x0 10.0 y0 20.0 x1 30.0 y1 40.0)).  This is also what the
+;;; RECT->PLIST / MATRIX->PLIST helpers in cl-mupdf.lisp produce.
+;;;
+;;; Structs that we only access through a pointer (pdf_redact_options_c,
+;;; fz_quad_c) do not need :class and are left as plain defcstruct.
+
+(cffi:defcstruct (fz-rect-c :class fz-rect-class)
   (x0 :float)
   (y0 :float)
   (x1 :float)
   (y1 :float))
 
-(cffi:defcstruct fz-matrix-c
+(defmethod cffi:translate-into-foreign-memory
+    (value (type fz-rect-class) ptr)
+  (setf (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'x0)
+        (float (getf value 'x0 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'y0)
+        (float (getf value 'y0 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'x1)
+        (float (getf value 'x1 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'y1)
+        (float (getf value 'y1 0.0) 0.0)))
+
+(defmethod cffi:translate-from-foreign (ptr (type fz-rect-class))
+  (list 'x0 (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'x0)
+        'y0 (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'y0)
+        'x1 (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'x1)
+        'y1 (cffi:foreign-slot-value ptr '(:struct fz-rect-c) 'y1)))
+
+(cffi:defcstruct (fz-matrix-c :class fz-matrix-class)
   (a :float)
   (b :float)
   (c :float)
   (d :float)
   (e :float)
   (f :float))
+
+(defmethod cffi:translate-into-foreign-memory
+    (value (type fz-matrix-class) ptr)
+  (setf (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'a)
+        (float (getf value 'a 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'b)
+        (float (getf value 'b 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'c)
+        (float (getf value 'c 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'd)
+        (float (getf value 'd 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'e)
+        (float (getf value 'e 0.0) 0.0)
+        (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'f)
+        (float (getf value 'f 0.0) 0.0)))
+
+(defmethod cffi:translate-from-foreign (ptr (type fz-matrix-class))
+  (list 'a (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'a)
+        'b (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'b)
+        'c (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'c)
+        'd (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'd)
+        'e (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'e)
+        'f (cffi:foreign-slot-value ptr '(:struct fz-matrix-c) 'f)))
 
 (cffi:defcstruct pdf-redact-options-c
   (black-boxes  :int)
@@ -136,7 +198,8 @@ MAKE-CONTEXT if you have a different MuPDF version installed.")
   (text         :int))
 
 ;; fz_quad - 4 corner points (ul, ur, ll, lr); used by fz_search_page
-;; and the structured-text API.
+;; and the structured-text API.  Only ever accessed through a pointer,
+;; so no :class option is needed.
 (cffi:defcstruct fz-quad-c
   (ul-x :float) (ul-y :float)
   (ur-x :float) (ur-y :float)
@@ -159,7 +222,7 @@ MAKE-CONTEXT if you have a different MuPDF version installed.")
 (cffi:defcfun ("fz_new_context_imp" %fz-new-context-imp) :pointer
   (alloc      :pointer)
   (locks      :pointer)
-  (max-store  :size)
+  (max-store  size-t)
   (version    :string))
 
 ;; void fz_drop_context(fz_context *ctx);
@@ -358,7 +421,7 @@ MAKE-CONTEXT if you have a different MuPDF version installed.")
 ;; fz_buffer *fz_new_buffer(fz_context *ctx, size_t capacity);
 (cffi:defcfun ("fz_new_buffer" %fz-new-buffer) :pointer
   (ctx      :pointer)
-  (capacity :size))
+  (capacity size-t))
 
 ;; void fz_drop_buffer(fz_context *ctx, fz_buffer *buf);
 (cffi:defcfun ("fz_drop_buffer" %fz-drop-buffer) :void

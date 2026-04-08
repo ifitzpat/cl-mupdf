@@ -20,11 +20,16 @@
 (defstruct rect
   "Axis-aligned rectangle in PDF user space (points, 1/72 inch).
 The y-axis grows upward.  Compatible with the layout of MuPDF's
-fz_rect: (x0, y0) is the lower-left, (x1, y1) the upper-right."
-  (x0 0.0 :type single-float)
-  (y0 0.0 :type single-float)
-  (x1 0.0 :type single-float)
-  (y1 0.0 :type single-float))
+fz_rect: (x0, y0) is the lower-left, (x1, y1) the upper-right.
+
+Slots accept any real number; coercion to single-float happens at the
+FFI boundary in RECT->PLIST.  This means you can pass
+\(make-rect :x0 100 :y0 200 :x1 300 :y1 250) without writing the
+decimal points."
+  (x0 0.0)
+  (y0 0.0)
+  (x1 0.0)
+  (y1 0.0))
 
 (defun rect-width (r)
   (- (rect-x1 r) (rect-x0 r)))
@@ -51,13 +56,16 @@ fz_rect: (x0, y0) is the lower-left, (x1, y1) the upper-right."
 
 (defstruct matrix
   "2x3 affine transform [a b ; c d ; e f] in MuPDF/PDF convention.
-Maps user-space coordinates (x, y) to (a*x + c*y + e, b*x + d*y + f)."
-  (a 1.0 :type single-float)
-  (b 0.0 :type single-float)
-  (c 0.0 :type single-float)
-  (d 1.0 :type single-float)
-  (e 0.0 :type single-float)
-  (f 0.0 :type single-float))
+Maps user-space coordinates (x, y) to (a*x + c*y + e, b*x + d*y + f).
+
+Slots accept any real number; coercion to single-float happens at the
+FFI boundary in MATRIX->PLIST."
+  (a 1.0)
+  (b 0.0)
+  (c 0.0)
+  (d 1.0)
+  (e 0.0)
+  (f 0.0))
 
 (defun identity-matrix ()
   (make-matrix))
@@ -200,10 +208,10 @@ captured per-thread is left to the user.")
 
 (cffi:defcallback mupdf-warning-cb :void
     ((user :pointer) (msg :string))
-  (declare (ignore user))
-  ;; Warnings are silently swallowed; users that care can rebind the
-  ;; callback themselves.
-  (declare (ignore msg)))
+  ;; Warnings are silently swallowed; callers that care can rebind
+  ;; the callback themselves.
+  (declare (ignore user msg))
+  nil)
 
 (defun install-error-callbacks (ctx-ptr)
   (%fz-set-error-callback   ctx-ptr (cffi:callback mupdf-error-cb)   (cffi:null-pointer))
@@ -272,7 +280,7 @@ Also binds *DEFAULT-CONTEXT* so the high-level functions can be called
 without an explicit context argument."
   `(let* ((,var (make-context ,@options))
           (*default-context* ,var))
-     (unwind-protect (progn ,@body)
+     (unwind-protect (locally ,@body)
        (drop-context ,var))))
 
 (defun register-document-handlers (&optional (ctx (default-context)))
@@ -323,7 +331,7 @@ The format is auto-detected from the file's contents and/or extension."
 
 (defmacro with-document ((var filename &rest open-args) &body body)
   `(let ((,var (open-document ,filename ,@open-args)))
-     (unwind-protect (progn ,@body)
+     (unwind-protect (locally ,@body)
        (drop-document ,var))))
 
 (defun count-pages (document)
@@ -387,7 +395,7 @@ default write options."
 
 (defmacro with-page ((var document number) &body body)
   `(let ((,var (load-page ,document ,number)))
-     (unwind-protect (progn ,@body)
+     (unwind-protect (locally ,@body)
        (drop-page ,var))))
 
 (defmacro do-pages ((var document &optional result) &body body)
