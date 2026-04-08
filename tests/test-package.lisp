@@ -34,3 +34,11 @@
 (def-suite :redaction
     :in :cl-mupdf
     :description "Content-stream redaction round-trip (requires libmupdf and a sample PDF)")
+
+(def-suite :matrix-algebra
+    :in :cl-mupdf
+    :description "Pure-Lisp matrix inversion and transformation helpers")
+
+(def-suite :extraction
+    :in :cl-mupdf
+    :description "Text extraction and search (requires libmupdf and a sample PDF)")

@@ -135,6 +135,14 @@ MAKE-CONTEXT if you have a different MuPDF version installed.")
   (line-art     :int)
   (text         :int))
 
+;; fz_quad - 4 corner points (ul, ur, ll, lr); used by fz_search_page
+;; and the structured-text API.
+(cffi:defcstruct fz-quad-c
+  (ul-x :float) (ul-y :float)
+  (ur-x :float) (ur-y :float)
+  (ll-x :float) (ll-y :float)
+  (lr-x :float) (lr-y :float))
+
 ;; pdf_write_options has many fields; we expose only the no-options
 ;; case (NULL pointer) which causes MuPDF to use sane defaults.
 
@@ -311,3 +319,83 @@ MAKE-CONTEXT if you have a different MuPDF version installed.")
   (doc      :pointer)
   (filename :string)
   (opts     :pointer))
+
+;;; --- Structured text and text extraction ------------------------------------
+
+;; fz_stext_page *fz_new_stext_page_from_page(fz_context *ctx,
+;;                                            fz_page *page,
+;;                                            const fz_stext_options *options);
+;; Pass NULL for options to get the defaults.
+(cffi:defcfun ("fz_new_stext_page_from_page" %fz-new-stext-page-from-page)
+    :pointer
+  (ctx     :pointer)
+  (page    :pointer)
+  (options :pointer))
+
+;; void fz_drop_stext_page(fz_context *ctx, fz_stext_page *page);
+(cffi:defcfun ("fz_drop_stext_page" %fz-drop-stext-page) :void
+  (ctx   :pointer)
+  (stext :pointer))
+
+;; void fz_print_stext_page_as_text(fz_context *ctx, fz_output *out,
+;;                                  fz_stext_page *page);
+(cffi:defcfun ("fz_print_stext_page_as_text" %fz-print-stext-page-as-text) :void
+  (ctx   :pointer)
+  (out   :pointer)
+  (stext :pointer))
+
+;; void fz_print_stext_page_as_xhtml(fz_context *ctx, fz_output *out,
+;;                                   fz_stext_page *page, int id);
+(cffi:defcfun ("fz_print_stext_page_as_xhtml" %fz-print-stext-page-as-xhtml)
+    :void
+  (ctx   :pointer)
+  (out   :pointer)
+  (stext :pointer)
+  (id    :int))
+
+;;; --- Buffers and outputs (for capturing text into a Lisp string) ------------
+
+;; fz_buffer *fz_new_buffer(fz_context *ctx, size_t capacity);
+(cffi:defcfun ("fz_new_buffer" %fz-new-buffer) :pointer
+  (ctx      :pointer)
+  (capacity :size))
+
+;; void fz_drop_buffer(fz_context *ctx, fz_buffer *buf);
+(cffi:defcfun ("fz_drop_buffer" %fz-drop-buffer) :void
+  (ctx :pointer)
+  (buf :pointer))
+
+;; const char *fz_string_from_buffer(fz_context *ctx, fz_buffer *buf);
+;; Implicitly calls fz_terminate_buffer; the returned pointer is owned
+;; by the buffer and remains valid until the buffer is dropped.
+(cffi:defcfun ("fz_string_from_buffer" %fz-string-from-buffer) :string
+  (ctx :pointer)
+  (buf :pointer))
+
+;; fz_output *fz_new_output_with_buffer(fz_context *ctx, fz_buffer *buf);
+(cffi:defcfun ("fz_new_output_with_buffer" %fz-new-output-with-buffer) :pointer
+  (ctx :pointer)
+  (buf :pointer))
+
+;; void fz_close_output(fz_context *ctx, fz_output *out);
+(cffi:defcfun ("fz_close_output" %fz-close-output) :void
+  (ctx :pointer)
+  (out :pointer))
+
+;; void fz_drop_output(fz_context *ctx, fz_output *out);
+(cffi:defcfun ("fz_drop_output" %fz-drop-output) :void
+  (ctx :pointer)
+  (out :pointer))
+
+;;; --- Searching --------------------------------------------------------------
+
+;; int fz_search_page(fz_context *ctx, fz_page *page, const char *needle,
+;;                    int *hit_mark, fz_quad *hit_bbox, int hit_max);
+;; Returns the number of hits actually written to hit_bbox (up to hit_max).
+(cffi:defcfun ("fz_search_page" %fz-search-page) :int
+  (ctx      :pointer)
+  (page     :pointer)
+  (needle   :string)
+  (hit-mark :pointer)
+  (hit-bbox :pointer)
+  (hit-max  :int))

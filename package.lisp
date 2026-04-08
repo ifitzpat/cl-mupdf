@@ -66,7 +66,11 @@ pages, place annotations and render pages to PNG.")
            #:identity-matrix
            #:scale-matrix
            #:translate-matrix
-           #:rotate-matrix)
+           #:rotate-matrix
+           #:matrix-determinant
+           #:invert-matrix
+           #:transform-point
+           #:transform-rect)
 
   ;; -----------------------------------------------------------------
   ;; Context management
@@ -101,6 +105,15 @@ pages, place annotations and render pages to PNG.")
            #:save-pixmap-as-png
            #:drop-pixmap
            #:do-pages)
+
+  ;; -----------------------------------------------------------------
+  ;; Text extraction and search
+  ;; -----------------------------------------------------------------
+  (:export #:extract-text
+           #:extract-html
+           #:search-page
+           #:search-document
+           #:*search-max-hits*)
 
   ;; -----------------------------------------------------------------
   ;; Annotations

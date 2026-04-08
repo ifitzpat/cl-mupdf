@@ -573,3 +573,227 @@ Returns OUTPUT-PDF."
   "Return the MuPDF version string cl-mupdf was compiled to expect.
 This must match the runtime libmupdf or fz_new_context_imp will fail."
   *mupdf-version*)
+
+;;; ============================================================================
+;;; Text extraction
+;;; ============================================================================
+;;;
+;;; The extract-text/extract-html generic functions hand the page off to
+;;; MuPDF's structured-text engine, capture the result in a transient
+;;; fz_buffer, and return the buffer's contents as a Lisp string.  This
+;;; replaces shelling out to pdftotext for the common case.
+;;;
+;;; MuPDF 1.26 does not provide a markdown writer in libmupdf itself;
+;;; if you need markdown, run extract-html through pandoc / turndown /
+;;; html2text.
+
+(defun %page-stext-as-string (page printer)
+  "Internal helper.  Build an fz_stext_page for PAGE, run PRINTER
+\(a function of (CTX OUT STEXT)) into a transient buffer, and return
+the captured text as a Lisp string.  All foreign resources are released
+with unwind-protect."
+  (let* ((doc     (page-document page))
+         (ctx-ptr (context-pointer (document-context doc)))
+         (stext   (%fz-new-stext-page-from-page ctx-ptr
+                                                (page-pointer page)
+                                                (cffi:null-pointer))))
+    (when (cffi:null-pointer-p stext)
+      (error 'mupdf-error
+             :message "fz_new_stext_page_from_page returned NULL"))
+    (unwind-protect
+         (let ((buf (%fz-new-buffer ctx-ptr 4096)))
+           (when (cffi:null-pointer-p buf)
+             (error 'mupdf-error :message "fz_new_buffer returned NULL"))
+           (unwind-protect
+                (let ((out (%fz-new-output-with-buffer ctx-ptr buf)))
+                  (when (cffi:null-pointer-p out)
+                    (error 'mupdf-error
+                           :message "fz_new_output_with_buffer returned NULL"))
+                  (unwind-protect
+                       (progn
+                         (funcall printer ctx-ptr out stext)
+                         (%fz-close-output ctx-ptr out)
+                         (maybe-error 'extract-text)
+                         (or (%fz-string-from-buffer ctx-ptr buf) ""))
+                    (%fz-drop-output ctx-ptr out)))
+             (%fz-drop-buffer ctx-ptr buf)))
+      (%fz-drop-stext-page ctx-ptr stext))))
+
+(defgeneric extract-text (object &key)
+  (:documentation
+   "Extract plain text from OBJECT, which is a PAGE or DOCUMENT.
+
+For a DOCUMENT, individual page texts are joined with SEPARATOR.
+The default separator is the form-feed character (#\\Page), which
+matches pdftotext's default page break, so cl-mupdf can be a drop-in
+replacement when you previously shelled out to pdftotext."))
+
+(defmethod extract-text ((page page) &key)
+  (%page-stext-as-string
+   page
+   (lambda (ctx out stext)
+     (%fz-print-stext-page-as-text ctx out stext))))
+
+(defmethod extract-text ((doc document) &key (separator (string #\Page)))
+  (with-output-to-string (s)
+    (let ((first t))
+      (do-pages (p doc)
+        (if first
+            (setf first nil)
+            (write-string separator s))
+        (write-string (extract-text p) s)))))
+
+(defgeneric extract-html (object &key)
+  (:documentation
+   "Extract structured XHTML from OBJECT, which is a PAGE or DOCUMENT.
+
+The XHTML is produced by MuPDF's fz_print_stext_page_as_xhtml and
+preserves block / line / span structure.  Suitable for downstream
+conversion to markdown via pandoc, turndown, or html2text:
+
+  $ pandoc -f html -t markdown < page.html > page.md
+
+libmupdf 1.26 does not ship a markdown writer; this is the recommended
+path."))
+
+(defmethod extract-html ((page page) &key (id 0))
+  (%page-stext-as-string
+   page
+   (lambda (ctx out stext)
+     (%fz-print-stext-page-as-xhtml ctx out stext id))))
+
+(defmethod extract-html ((doc document) &key)
+  (with-output-to-string (s)
+    (write-line "<html><body>" s)
+    (let ((id 0))
+      (do-pages (p doc)
+        (write-string (extract-html p :id id) s)
+        (incf id)))
+    (write-line "</body></html>" s)))
+
+;;; ============================================================================
+;;; Searching
+;;; ============================================================================
+
+(defparameter *search-max-hits* 256
+  "Default upper bound on the number of hits returned by SEARCH-PAGE
+in a single call.  Override per-call with the :MAX-HITS keyword.")
+
+(defun %quad->rect (quad-ptr)
+  "Convert an fz_quad at QUAD-PTR into the smallest axis-aligned RECT
+that contains it.  Redaction marks are rectangular, so collapsing the
+quad to its bounding box is lossless for our purposes."
+  (let ((ulx (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'ul-x))
+        (uly (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'ul-y))
+        (urx (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'ur-x))
+        (ury (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'ur-y))
+        (llx (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'll-x))
+        (lly (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'll-y))
+        (lrx (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'lr-x))
+        (lry (cffi:foreign-slot-value quad-ptr '(:struct fz-quad-c) 'lr-y)))
+    (make-rect :x0 (float (min ulx urx llx lrx) 0.0)
+               :y0 (float (min uly ury lly lry) 0.0)
+               :x1 (float (max ulx urx llx lrx) 0.0)
+               :y1 (float (max uly ury lly lry) 0.0))))
+
+(defun search-page (page query &key (max-hits *search-max-hits*))
+  "Search PAGE for occurrences of the literal string QUERY.  Returns
+a list of axis-aligned RECT objects, one per hit, in PDF user-space.
+Up to MAX-HITS results are returned.
+
+This is the cleanest way to wire MuPDF redaction to a text-PII pipeline:
+extract the page text once, run a regex / NER over it, and pass each
+matched literal back through SEARCH-PAGE to recover the bbox."
+  (let* ((doc     (page-document page))
+         (ctx-ptr (context-pointer (document-context doc))))
+    (cffi:with-foreign-objects ((quads '(:struct fz-quad-c) max-hits)
+                                (marks :int max-hits))
+      (let ((n (%fz-search-page ctx-ptr (page-pointer page)
+                                query marks quads max-hits)))
+        (maybe-error 'search-page)
+        (loop for i from 0 below n
+              collect (%quad->rect
+                       (cffi:mem-aptr quads '(:struct fz-quad-c) i)))))))
+
+(defun search-document (document query &key (max-hits *search-max-hits*))
+  "Run SEARCH-PAGE across every page of DOCUMENT.  Returns a list of
+\(PAGE-INDEX . RECT) pairs."
+  (let ((results '()))
+    (do-pages (p document)
+      (let ((page-index (page-number p)))
+        (dolist (rect (search-page p query :max-hits max-hits))
+          (push (cons page-index rect) results))))
+    (nreverse results)))
+
+;;; ============================================================================
+;;; Matrix algebra (pure Lisp)
+;;; ============================================================================
+;;;
+;;; These helpers are pure-Lisp.  Their main use is mapping pixel-space
+;;; bounding boxes (e.g. YOLO output on a rendered page pixmap) back
+;;; into PDF user-space, by inverting the matrix that was used to render
+;;; the page in the first place.
+
+(defun matrix-determinant (m)
+  "Determinant of the affine 2x2 part of M."
+  (- (* (matrix-a m) (matrix-d m))
+     (* (matrix-b m) (matrix-c m))))
+
+(defun invert-matrix (m)
+  "Return the inverse of the affine matrix M.  Signals MUPDF-ERROR if
+M is singular."
+  (let ((det (matrix-determinant m)))
+    (when (zerop det)
+      (error 'mupdf-error
+             :message "invert-matrix: matrix is singular"))
+    (let ((inv (/ 1.0 det)))
+      (make-matrix
+       :a (float (* (matrix-d m) inv) 0.0)
+       :b (float (- (* (matrix-b m) inv)) 0.0)
+       :c (float (- (* (matrix-c m) inv)) 0.0)
+       :d (float (* (matrix-a m) inv) 0.0)
+       :e (float (* (- (* (matrix-c m) (matrix-f m))
+                       (* (matrix-d m) (matrix-e m)))
+                    inv)
+                 0.0)
+       :f (float (* (- (* (matrix-b m) (matrix-e m))
+                       (* (matrix-a m) (matrix-f m)))
+                    inv)
+                 0.0)))))
+
+(defun transform-point (x y matrix)
+  "Apply MATRIX to the point (X, Y).  Returns two values, the
+transformed (x', y') as single-floats."
+  (values (float (+ (* (matrix-a matrix) x)
+                    (* (matrix-c matrix) y)
+                    (matrix-e matrix))
+                 0.0)
+          (float (+ (* (matrix-b matrix) x)
+                    (* (matrix-d matrix) y)
+                    (matrix-f matrix))
+                 0.0)))
+
+(defun transform-rect (rect matrix)
+  "Transform RECT through MATRIX.  Returns the smallest axis-aligned
+RECT containing all four transformed corners.
+
+The intended use case is mapping pixel-space detection boxes (YOLO,
+SAM, signature/face detectors run over a rendered page pixmap) back
+into PDF user-space.  Compose with INVERT-MATRIX on the rendering
+matrix you used:
+
+  (let* ((render-m (cl-mupdf:scale-matrix 2.0))
+         (inv      (cl-mupdf:invert-matrix render-m)))
+    (cl-mupdf:transform-rect pixel-box inv))"
+  (multiple-value-bind (xa ya)
+      (transform-point (rect-x0 rect) (rect-y0 rect) matrix)
+    (multiple-value-bind (xb yb)
+        (transform-point (rect-x1 rect) (rect-y0 rect) matrix)
+      (multiple-value-bind (xc yc)
+          (transform-point (rect-x0 rect) (rect-y1 rect) matrix)
+        (multiple-value-bind (xd yd)
+            (transform-point (rect-x1 rect) (rect-y1 rect) matrix)
+          (make-rect :x0 (float (min xa xb xc xd) 0.0)
+                     :y0 (float (min ya yb yc yd) 0.0)
+                     :x1 (float (max xa xb xc xd) 0.0)
+                     :y1 (float (max ya yb yc yd) 0.0)))))))

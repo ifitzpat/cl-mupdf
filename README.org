@@ -120,6 +120,97 @@ Every MuPDF object cl-mupdf wraps -- =context=, =document=, =page=,
 references will eventually be released.  For predictable lifetimes
 prefer the =with-= macros (=with-context=, =with-document=, =with-page=).
 
+** Text extraction and search
+
+cl-mupdf wraps MuPDF's structured-text engine, so you don't need to
+shell out to =pdftotext=:
+
+#+begin_src lisp
+;; Plain text from a single page
+(cl-mupdf:with-context (ctx)
+  (cl-mupdf:with-document (doc "report.pdf")
+    (cl-mupdf:with-page (p doc 0)
+      (cl-mupdf:extract-text p))))                ; => "Lorem ipsum ..."
+
+;; Whole document, pages joined with #\Page (form-feed; pdftotext default)
+(cl-mupdf:with-context (ctx)
+  (cl-mupdf:with-document (doc "report.pdf")
+    (cl-mupdf:extract-text doc)))
+
+;; Structured XHTML preserving block / line / span structure
+(cl-mupdf:extract-html doc)
+#+end_src
+
+For literal-string search (the cleanest input to a redaction
+pipeline), use =search-page= / =search-document=:
+
+#+begin_src lisp
+(cl-mupdf:with-page (p doc 0)
+  (cl-mupdf:search-page p "John Doe"))
+;; => (#S(RECT :X0 132.4 :Y0 678.1 :X1 187.0 :Y1 690.3) ...)
+#+end_src
+
+*** Markdown output?
+
+libmupdf 1.26 does not ship a markdown writer.  =extract-html=
+produces well-formed XHTML from MuPDF's =fz_print_stext_page_as_xhtml=,
+and the recommended path to markdown is to pipe that through pandoc
+or =html2text=:
+
+#+begin_src sh
+pandoc -f html -t markdown_strict < page.html > page.md
+#+end_src
+
+** PII redaction workflow
+
+Combining the pieces, end-to-end PII redaction looks like this:
+
+#+begin_src lisp
+(defun pii-p (text) ...) ; your NER / regex / Presidio call
+
+(cl-mupdf:with-context (ctx)
+  (cl-mupdf:with-document (doc "input.pdf")
+    (cl-mupdf:do-pages (p doc)
+      ;; --- Text PII: extract page text, find PII spans, look them
+      ;;     up on the page to recover bounding boxes.
+      (let ((text (cl-mupdf:extract-text p)))
+        (dolist (hit (find-pii-substrings text))    ; user code
+          (dolist (rect (cl-mupdf:search-page p hit))
+            (cl-mupdf:add-redaction p rect))))
+
+      ;; --- Visual PII: render the page, run YOLO / a face detector,
+      ;;     map pixel-space boxes back to PDF user-space by inverting
+      ;;     the rendering matrix.
+      (let* ((render-m (cl-mupdf:scale-matrix 2.0))
+             (png      (cl-mupdf:save-page-as-png p "/tmp/page.png"
+                                                  :matrix render-m))
+             (inv      (cl-mupdf:invert-matrix render-m)))
+        (declare (ignore png))
+        (dolist (pixel-box (yolo-detect-faces "/tmp/page.png")) ; user code
+          (cl-mupdf:add-redaction
+           p (cl-mupdf:transform-rect pixel-box inv)))))
+
+    ;; Strip the marked content and save.
+    (cl-mupdf:redact-document doc)
+    (cl-mupdf:save-document doc "redacted.pdf")))
+#+end_src
+
+The pieces involved:
+
+| Function          | Purpose                                                |
+|-------------------+--------------------------------------------------------|
+| =extract-text=    | Plain page text for NER / regex / VLLM PII detection   |
+| =search-page=     | Map a literal PII string back to bounding boxes        |
+| =render-page-to-pixmap= | Render a page for visual detectors                   |
+| =invert-matrix= / =transform-rect= | Map pixel boxes back into user-space    |
+| =add-redaction=   | Place a =PDF_ANNOT_REDACT= mark on the page            |
+| =redact-document= | Run =pdf_redact_page= and strip the content stream     |
+| =save-document=   | Persist the redacted PDF                               |
+
+The whole pipeline only depends on cl-mupdf, your NER of choice, and
+your visual detector of choice -- no =pdftotext=, =qpdf=, or other
+shell-outs.
+
 ** Coordinate space
 
 cl-mupdf uses MuPDF's coordinate convention, not the historical PDF
