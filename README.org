@@ -1,0 +1,172 @@
+#+TITLE: cl-mupdf -- Common Lisp CFFI bindings for MuPDF
+#+AUTHOR: Ian FitzPatrick
+#+OPTIONS: toc:2
+
+* Overview
+
+=cl-mupdf= is a Common Lisp wrapper around [[https://mupdf.com][Artifex MuPDF]], built on top
+of [[https://cffi.common-lisp.dev/][CFFI]].  Its primary use case is *content-stream level PDF redaction*:
+unlike libraries that simply paint black boxes over sensitive regions
+of a page, MuPDF's =pdf_redact_page= actually removes the underlying
+text runs and image data from the PDF content stream, which is the
+only correct way to redact a PDF.
+
+The library also exposes enough of the MuPDF API to:
+
+- open documents (PDF, XPS, EPUB, CBZ, ... -- whatever MuPDF supports);
+- enumerate pages and query their bounding boxes;
+- render pages to PNG (via =fz_pixmap= and =fz_save_pixmap_as_png=);
+- place arbitrary PDF annotations (highlight, underline, redact, ...);
+- save modified PDF documents.
+
+* Installation
+
+** Dependencies
+
+System dependencies:
+
+- =libmupdf.so= (Guix: =mupdf=, Debian/Ubuntu: =libmupdf-dev=, ...)
+
+Common Lisp dependencies (all available on Quicklisp):
+
+- =cffi=
+- =alexandria=
+- =trivial-garbage=
+- =fiveam= (test only)
+
+** Quicklisp / ASDF
+
+Drop the =cl-mupdf= directory into =~/quicklisp/local-projects/= or
+add its parent to =asdf:*central-registry*=, then:
+
+#+begin_src lisp
+(ql:quickload :cl-mupdf)
+#+end_src
+
+** Guix
+
+A =guix.scm= manifest is included for hacking on the package locally:
+
+#+begin_src sh
+guix shell -D -f guix.scm          # Development shell
+guix shell -f guix.scm -- sbcl     # SBCL with cl-mupdf preloaded
+guix build -f guix.scm             # Build the package
+#+end_src
+
+The Guix package wires =libmupdf.so= directly into =ffi.lisp= so that
+=cffi:load-foreign-library= picks up the exact MuPDF the package was
+built against, sidestepping any version-skew problems with
+=fz_new_context_imp=.
+
+* Quick start: redact a PDF
+
+The headline use case is one function call:
+
+#+begin_src lisp
+(cl-mupdf:redact-pdf-file
+ "input.pdf" "output.pdf"
+ :marks '((0 (100 100 200 120))     ; page 0, x0 y0 x1 y1 in points
+          (0 (250 100 350 120))
+          (3 ( 50 600 550 650))))
+#+end_src
+
+This:
+
+1. opens =input.pdf=,
+2. places a =PDF_ANNOT_REDACT= annotation at each rectangle,
+3. calls =pdf_redact_page= on every page that has any redactions,
+4. saves the result to =output.pdf= using MuPDF's default write options.
+
+The redaction options are configurable:
+
+#+begin_src lisp
+(let ((opts (cl-mupdf:make-redact-options
+             :black-boxes  t
+             :image-method cl-mupdf:+redact-image-pixels+
+             :line-art     cl-mupdf:+redact-line-art-remove-if-touched+
+             :text         cl-mupdf:+redact-text-remove+)))
+  (cl-mupdf:redact-pdf-file "in.pdf" "out.pdf"
+                            :marks '((0 (100 100 300 130)))
+                            :options opts))
+#+end_src
+
+* Lower-level API
+
+If you want more control, the building blocks are exported separately:
+
+#+begin_src lisp
+(cl-mupdf:with-context (ctx)
+  (cl-mupdf:with-document (doc "input.pdf")
+    (format t "~D pages~%" (cl-mupdf:count-pages doc))
+    (cl-mupdf:with-page (p doc 0)
+      ;; Read the page bounds.
+      (let ((box (cl-mupdf:bound-page p)))
+        (format t "page 0 = ~A x ~A~%"
+                (cl-mupdf:rect-width box)
+                (cl-mupdf:rect-height box)))
+      ;; Add a redaction mark and render to PNG before applying it.
+      (cl-mupdf:add-redaction p '(100 100 200 120))
+      (cl-mupdf:save-page-as-png p "preview.png"
+                                 :matrix (cl-mupdf:scale-matrix 2.0)))
+    ;; Strip the marked content.
+    (cl-mupdf:redact-document doc)
+    (cl-mupdf:save-document doc "output.pdf")))
+#+end_src
+
+** Resource management
+
+Every MuPDF object cl-mupdf wraps -- =context=, =document=, =page=,
+=pixmap= -- has a finalizer registered via =trivial-garbage=, so leaked
+references will eventually be released.  For predictable lifetimes
+prefer the =with-= macros (=with-context=, =with-document=, =with-page=).
+
+** Coordinate space
+
+cl-mupdf uses MuPDF's coordinate convention, not the historical PDF
+one: a =rect= is =(x0 y0 x1 y1)= where =(x0 y0)= is the lower-left
+corner in points (1/72 inch), with the y-axis growing upward.
+
+* Caveats
+
+** Error handling
+
+MuPDF reports errors through the =fz_try= / =fz_catch= macros, which
+expand to =setjmp/longjmp= around the *caller's* stack frame.  Those
+macros cannot be invoked from foreign code, so cl-mupdf cannot catch a
+thrown MuPDF exception in pure Lisp.
+
+To compensate, cl-mupdf installs an error callback via
+=fz_set_error_callback= that captures the most recent error message
+into =*last-mupdf-error*=, and treats =NULL= return values as failure.
+Most operational errors (file-not-found, password required,
+ill-formed PDF) come back as =MUPDF-ERROR= conditions.
+
+For belt-and-braces safety in long-running processes, link against a
+small C shim that wraps each call in =fz_try/fz_catch= and rebind the
+=cl-mupdf::%...= functions to the shim.
+
+** Version matching
+
+=fz_new_context_imp= takes a version string and refuses to construct a
+context if it does not match the linked =libmupdf.so=.  cl-mupdf
+defaults to =1.26.8= (matching the version currently in Guix); if you
+have a different MuPDF installed, set =cl-mupdf:*mupdf-version*=
+before calling =make-context= or =with-context=.
+
+* Tests
+
+#+begin_src lisp
+(asdf:test-system :cl-mupdf)
+#+end_src
+
+The pure-Lisp tests (rect/matrix arithmetic, exports, constant values,
+condition shape) always run.  The integration suites that need a real
+=libmupdf.so= or a sample PDF skip themselves cleanly when the
+prerequisites are missing.  To run the redaction round-trip locally,
+drop a =sample.pdf= into =tests/= or set =CL_MUPDF_SAMPLE_PDF= in the
+environment.
+
+* License
+
+AGPL-3.0-or-later.  Same license as MuPDF itself, which makes
+distribution simple.
